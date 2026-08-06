@@ -2,9 +2,8 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 import sys
-sys.path.append('IonExchangeModel')
+sys.path.append('Water_Treatment_Models/IonExchangeModel')
 from ixpy import hsdmix
-
 st.set_page_config(page_title="IX Breakthrough Simulator", layout="centered")
 st.title("Ion Exchange Breakthrough Simulator")
 st.write("Based on the EPA's HSDM ion exchange model.")
@@ -14,7 +13,7 @@ run = st.button("Run Simulation")
 
 if run:
     hours = np.linspace(0, hours_max, num=hours_max+1)
-    IEX = hsdmix.HSDMIX('IonExchangeModel/test/data/reg_test_input.xlsx')
+    IEX = hsdmix.HSDMIX('Water_Treatment_Models/IonExchangeModel/test/data/reg_test_input.xlsx')
     t, u = IEX.solve(t_eval=hours, const_Cin=True)
 
     fig = go.Figure()
