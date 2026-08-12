@@ -9,6 +9,61 @@ sys.path.append('Water_Treatment_Models/IonExchangeModel')
 from ixpy import hsdmix
 from ixpy.paramsheets import conv_length, conv_vel
 
+def _run_feasibility(influent_ppt, limit_ppt, flow_gpm, bed_depth_cm, diam_cm,
+                     Kxc, Ds, Qf, kL, rb, EBED, alk_meq, sim_hours, resin_cost_per_L):
+    """Runs the EPA HSDM engine and derives breakthrough time, bed volumes, and cost."""
+    params = pd.DataFrame([
+        {"name": "Qf", "value": Qf, "units": "meq/L"},
+        {"name": "L", "value": bed_depth_cm, "units": "cm"},
+        {"name": "flrt", "value": flow_gpm, "units": "gpm"},
+        {"name": "diam", "value": diam_cm, "units": "cm"},
+        {"name": "rb", "value": rb, "units": "cm"},
+        {"name": "kL", "value": kL, "units": "cm/s"},
+        {"name": "Ds", "value": Ds, "units": "cm2/s"},
+        {"name": "nr", "value": 9, "units": None},
+        {"name": "nz", "value": 19, "units": None},
+        {"name": "EBED", "value": EBED, "units": None},
+        {"name": "time", "value": 1.0, "units": "hr"},
+    ])
+    ions = pd.DataFrame({
+        "name": ["BICARBONATE", "TARGET"], "mw": [61.02, 414.07],
+        "Kxc": [1.0, Kxc], "valence": [1, 1], "units": ["meq", "meq"],
+    })
+    C0 = 1e-5
+    cin = pd.DataFrame({"Time": [0, sim_hours],
+                        "BICARBONATE": [alk_meq, alk_meq], "TARGET": [C0, C0]})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        params.to_excel(w, sheet_name="params", index=False)
+        ions.to_excel(w, sheet_name="ions", index=False)
+        cin.to_excel(w, sheet_name="Cin", index=False)
+    buf.seek(0)
+
+    IEX = hsdmix.HSDMIX(buf)
+    hrs = np.linspace(0, sim_hours, num=500)
+    t, u = IEX.solve(t_eval=hrs, const_Cin=True)
+    t_hr = t / IEX.time_mult
+    CC0 = u[0, 1, -1, :] / C0
+
+    bed_L = np.pi * (diam_cm / 2) ** 2 * bed_depth_cm / 1000
+    flow_Lmin = flow_gpm * 3.785
+    out = {"t_days": t_hr / 24, "eff_ppt": CC0 * influent_ppt, "CC0": CC0,
+           "bed_L": bed_L, "ebct_min": bed_L / flow_Lmin, "bt_days": None}
+
+    idx = np.where(CC0 >= limit_ppt / influent_ppt)[0]
+    if len(idx):
+        bt_hr = t_hr[idx[0]]
+        out.update({
+            "bt_days": bt_hr / 24,
+            "BV": (flow_Lmin * 60 * bt_hr) / bed_L,
+            "changeouts_yr": 8760 / bt_hr,
+            "charge_cost": bed_L * resin_cost_per_L,
+            "annual": bed_L * resin_cost_per_L * (8760 / bt_hr),
+            "gal_yr": flow_gpm * 60 * 8760,
+            "per_kgal": 1000 * (bed_L * resin_cost_per_L * (8760 / bt_hr)) / (flow_gpm * 60 * 8760),
+        })
+    return out
+
 st.set_page_config(page_title="Ion Exchange Breakthrough Simulator", layout="wide")
 st.title("Ion Exchange Breakthrough Simulator")
 st.caption("Built on the EPA's HSDM (Homogeneous Surface Diffusion Model). Rebuilt to match the EPA's official Shiny app inputs, using the EPA's own unit conversion code internally.")
@@ -29,7 +84,7 @@ uploaded_file = st.file_uploader("Upload a pre-built .xlsx file matching the par
 if uploaded_file is not None:
     st.info("Uploaded file will be used directly when you click Run Simulation, bypassing the form below.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Column Parameters", "Ions", "Alkalinity", "kL Guesser"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Column Parameters", "Ions", "Alkalinity", "kL Guesser", "Feasibility Screening"])
 
 with tab1:
     st.subheader("Resin Characteristics")
@@ -318,3 +373,141 @@ if "results" in st.session_state:
     export_buffer.seek(0)
     st.download_button("Download Results (Excel)", data=export_buffer,
                         file_name="ix_simulation_results.xlsx")
+
+# ============================================================
+# TAB 5: FEASIBILITY SCREENING (operator-facing)
+# ============================================================
+with tab5:
+    st.subheader("IX Feasibility Screening for PFAS")
+    st.markdown("""
+**How this works.** The same EPA HSDM engine used above predicts how contaminant concentration
+in the treated water rises over time as the resin fills up. The single number that decides
+feasibility is **breakthrough time**: the day the predicted effluent first crosses your regulatory
+limit. From that one number everything else follows by arithmetic, how many bed volumes you treat
+per resin charge, how many changeouts per year, and what that costs per 1,000 gallons.
+
+**Why bed volumes matter.** Bed volumes (BV) is the standard way IX systems are compared, because it
+removes the effect of system size. Published PFAS IX studies commonly report **50,000 to 300,000+ BV**
+before breakthrough. If this tool returns a number in that range, the physics is behaving sensibly.
+If it returns 2,000, the inputs are wrong.
+    """)
+
+    st.warning("""**Calibration honesty.** The PFAS selectivity coefficient (Kxc) has not yet been taken from
+published PFAS-resin literature. The default of 1,000 was **back-calculated** so the model reproduces the
+literature-observed 50,000-300,000 BV range, it is a calibration, not a measured value. Bed life scales
+roughly linearly with Kxc, so treat the output as a planning-level estimate with a real uncertainty band,
+not a design number. Use the sensitivity chart below to see how much that assumption moves the answer.""")
+
+    st.markdown("### Inputs")
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        st.markdown("**Your water**")
+        f_influent = st.number_input("Raw water PFAS (ppt)", value=25.0, min_value=0.1)
+        f_limit = st.number_input("Regulatory limit (ppt)", value=4.0, min_value=0.1)
+        f_alk = st.number_input("Alkalinity / competing anions (meq/L)", value=3.0, min_value=0.1)
+    with fc2:
+        st.markdown("**Your system**")
+        f_flow = st.number_input("Flow rate (gpm)", value=50.0, min_value=0.1)
+        f_depth = st.number_input("Bed depth (cm)", value=100.0, min_value=1.0)
+        f_diam = st.number_input("Vessel diameter (cm)", value=60.0, min_value=1.0)
+    with fc3:
+        st.markdown("**Resin & cost**")
+        f_cost = st.number_input("Resin cost ($/L)", value=25.0, min_value=0.0,
+                                  help="Get a real vendor quote. This drives the entire cost output.")
+        f_Kxc = st.number_input("PFAS selectivity, Kxc", value=1000.0, min_value=1.0,
+                                 help="Calibrated default. See warning above.")
+        f_years = st.slider("Simulate up to (years)", 1, 5, 2)
+
+    with st.expander("Advanced resin parameters (defaults from EPA trace test file)"):
+        a1, a2 = st.columns(2)
+        with a1:
+            f_Qf = st.number_input("Resin capacity Qf (meq/L)", value=715.0)
+            f_rb = st.number_input("Bead radius (cm)", value=0.037, format="%.4f")
+            f_EBED = st.number_input("Bed porosity", value=0.35, min_value=0.01, max_value=0.99)
+        with a2:
+            f_kL = st.number_input("Film transfer kL (cm/s)", value=0.004, format="%.5f")
+            f_Ds = st.number_input("Surface diffusion Ds (cm2/s)", value=5e-8, format="%.2e")
+
+    if st.button("Run Feasibility Screening", type="primary"):
+        if f_limit >= f_influent:
+            st.success("Your raw water is already at or below the limit. No treatment needed for this contaminant.")
+        else:
+            try:
+                sim_hours = f_years * 8760
+                res = _run_feasibility(f_influent, f_limit, f_flow, f_depth, f_diam,
+                                        f_Kxc, f_Ds, f_Qf, f_kL, f_rb, f_EBED,
+                                        f_alk, sim_hours, f_cost)
+
+                st.markdown("### Results")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Bed volume", f"{res['bed_L']:.0f} L")
+                m2.metric("EBCT", f"{res['ebct_min']:.2f} min")
+
+                if res["bt_days"] is None:
+                    m3.metric("Breakthrough", f">{f_years} yr")
+                    m4.metric("Verdict", "Favorable")
+                    st.success(f"No breakthrough predicted within {f_years} year(s). "
+                               "Ion exchange looks well-suited at these conditions.")
+                else:
+                    m3.metric("Breakthrough", f"{res['bt_days']:.0f} days")
+                    m4.metric("Bed volumes", f"{res['BV']:,.0f}")
+
+                    if res['BV'] < 20000:
+                        st.error("Low bed life. Resin would exhaust quickly, IX may be costly here. "
+                                 "Check competing anion levels, they compete directly with PFAS for sites.")
+                    elif res['BV'] < 50000:
+                        st.warning("Moderate bed life, below the typical published range. Worth a pilot test.")
+                    else:
+                        st.success("Bed life falls within the range published PFAS IX studies report.")
+
+                    st.markdown("### Cost")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Resin charge", f"${res['charge_cost']:,.0f}")
+                    c2.metric("Changeouts / yr", f"{res['changeouts_yr']:.2f}")
+                    c3.metric("Cost / 1,000 gal", f"${res['per_kgal']:.3f}")
+                    st.caption(f"Annual resin cost: ${res['annual']:,.0f} "
+                               f"treating {res['gal_yr']:,.0f} gallons per year. "
+                               "Resin media only, excludes vessels, install, labor, and spent-resin disposal.")
+
+                figb = go.Figure()
+                figb.add_trace(go.Scatter(x=res["t_days"], y=res["eff_ppt"],
+                                           mode="lines", name="Predicted effluent"))
+                figb.add_hline(y=f_limit, line_dash="dash", line_color="red",
+                                annotation_text=f"Limit {f_limit} ppt")
+                figb.add_hline(y=f_influent, line_dash="dot", line_color="gray",
+                                annotation_text=f"Influent {f_influent} ppt")
+                if res["bt_days"]:
+                    figb.add_vline(x=res["bt_days"], line_dash="dash", line_color="orange",
+                                    annotation_text=f"{res['bt_days']:.0f} d")
+                figb.update_layout(title="Predicted Breakthrough Curve",
+                                    xaxis_title="Days in service", yaxis_title="Effluent PFAS (ppt)")
+                st.plotly_chart(figb, use_container_width=True)
+
+                st.markdown("### Sensitivity to the selectivity assumption")
+                st.caption("Because Kxc is calibrated rather than measured, this shows how the answer "
+                           "moves across a range around your value.")
+                sens_K, sens_bt, sens_bv = [], [], []
+                for mult in [0.25, 0.5, 1.0, 2.0, 4.0]:
+                    K = f_Kxc*mult
+                    r2 = _run_feasibility(f_influent, f_limit, f_flow, f_depth, f_diam,
+                                           K, f_Ds, f_Qf, f_kL, f_rb, f_EBED,
+                                           f_alk, sim_hours, f_cost)
+                    if r2["bt_days"]:
+                        sens_K.append(K); sens_bt.append(r2["bt_days"]); sens_bv.append(r2["BV"])
+                if sens_K:
+                    figs = go.Figure()
+                    figs.add_trace(go.Bar(x=[f"{k:,.0f}" for k in sens_K], y=sens_bt,
+                                           name="Breakthrough (days)"))
+                    figs.update_layout(title="Bed life vs. selectivity assumption",
+                                        xaxis_title="Kxc", yaxis_title="Breakthrough (days)")
+                    st.plotly_chart(figs, use_container_width=True)
+                    st.caption(f"Across this range, predicted bed life spans "
+                               f"{min(sens_bt):.0f} to {max(sens_bt):.0f} days "
+                               f"({min(sens_bv):,.0f} to {max(sens_bv):,.0f} BV). "
+                               "That spread is the honest uncertainty until measured values are sourced.")
+
+                if res["ebct_min"] < 2.0:
+                    st.info(f"Note: EBCT of {res['ebct_min']:.2f} min is below the 2-5 min range typically "
+                            "used for PFAS IX. A deeper bed or larger vessel would raise contact time.")
+            except Exception as e:
+                st.error(f"Screening failed: {e}")
