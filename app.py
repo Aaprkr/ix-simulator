@@ -5,8 +5,11 @@ import plotly.graph_objects as go
 sys.path.append('Water_Treatment_Models/IonExchangeModel')
 from ixpy import hsdmix
 from ixpy.paramsheets import conv_length, conv_vel
+import copy
 from core import (PFAS_DB, BG_IONS, MCL, CARY, simulate, analyze,
-                  bed_life, solve_depth, sweep_depth)
+                  bed_life, solve_depth, sweep_depth, RESINS,
+                  estimate_KxA, KxA_from_bedvolumes,
+                  LFER_SLOPE, LFER_INTERCEPT, PFSA_FACTOR)
 from style import CSS, PLOT, SERIES
 
 st.set_page_config(page_title="Breakthrough", page_icon="~", layout="wide")
@@ -20,6 +23,12 @@ D = st.session_state.setdefault
 D("Q",1000.0); D("EBED",0.35); D("L",14.76); D("v",0.123); D("rb",0.03375)
 D("kL",0.0021); D("nr",7); D("nz",13); D("diam",60.0); D("flow_gpm",50.0)
 D("cost",25.0); D("thresh",10)
+if "db" not in st.session_state:
+    st.session_state.db = copy.deepcopy(PFAS_DB)
+if "mcl" not in st.session_state:
+    st.session_state.mcl = dict(MCL)
+DB = st.session_state.db
+MCLS = st.session_state.mcl
 
 # ================= SIDEBAR =================
 with st.sidebar:
@@ -31,6 +40,7 @@ with st.sidebar:
         "Design solver",
         "Bed & flow",
         "Selectivity data",
+        "Selectivity calculator",
         "Alkalinity converter",
         "Film transfer estimator",
     ], label_visibility="collapsed")
@@ -100,7 +110,7 @@ if page == "Dashboard":
     st.markdown("### Breakthrough timeline")
     st.caption(f"When each species reaches {st.session_state.thresh}% of influent.")
     tl=[]
-    for n in sorted(curves,key=lambda k:PFAS_DB[k]["KxA"]):
+    for n in sorted(curves,key=lambda k:DB[k]["KxA"]):
         s=curves[n]; i=np.where(s>=thr)[0]
         tl.append((n, td[i[0]] if len(i) else None))
     reached=[(n,d) for n,d in tl if d is not None]
@@ -257,7 +267,7 @@ elif page == "Simulator":
     if st.button("Run simulation", type="primary"):
         with st.spinner("Solving transport equations"):
             try:
-                td,BV,curves = simulate(selected, cin,
+                td,BV,curves = simulate(selected, cin, db=DB,
                     Q=st.session_state.Q, EBED=st.session_state.EBED,
                     L=st.session_state.L, v=st.session_state.v,
                     rb=st.session_state.rb, kL=st.session_state.kL,
@@ -272,7 +282,7 @@ elif page == "Simulator":
             st.warning("Every selected species has zero influent concentration.")
             st.stop()
         thr=st.session_state.thresh/100
-        recs,first,fsp = analyze(curves,td,BV,cin_used,thr)
+        recs,first,fsp = analyze(curves,td,BV,cin_used,thr,db=DB,mcl=MCLS)
 
         st.divider()
         if fsp:
@@ -288,7 +298,7 @@ elif page == "Simulator":
             st.success(f"No species reached {st.session_state.thresh}% within "
                        f"{td[-1]:,.0f} days. Extend the influent time range to find bed life.")
 
-        order=sorted(curves,key=lambda k:PFAS_DB[k]["KxA"])
+        order=sorted(curves,key=lambda k:DB[k]["KxA"])
         xmode=st.radio("Horizontal axis",["Bed volumes","Days"],horizontal=True)
         x = BV/1000 if xmode=="Bed volumes" else td
         xl = "throughput · 1000 bed volumes" if xmode=="Bed volumes" else "days in service"
@@ -296,7 +306,7 @@ elif page == "Simulator":
         fig=go.Figure()
         for i,n in enumerate(order):
             fig.add_trace(go.Scatter(x=x,y=curves[n],mode="lines",
-                name=f"{n} C{PFAS_DB[n]['c']}",
+                name=f"{n} C{DB[n]['c']}",
                 line=dict(width=2.2,color=SERIES[i%len(SERIES)])))
         fig.add_hline(y=1.0,line_dash="dot",line_color="rgba(255,255,255,0.3)")
         fig.add_hline(y=thr,line_dash="dash",line_color="#FF6B6B")
@@ -344,7 +354,30 @@ elif page == "Simulator":
 # ================= BED & FLOW =================
 elif page == "Bed & flow":
     st.title("Bed and flow")
-    st.write("These values feed every simulation. Defaults match EPA's published example column.")
+    st.write("These values feed every simulation. Pick a commercial resin to load its published "
+             "specifications, or enter values manually.")
+
+    st.markdown("### Resin selection")
+    pick = st.selectbox("Commercial resin", list(RESINS.keys()), key="resin_pick")
+    spec = RESINS[pick]
+    if spec:
+        i1,i2,i3,i4 = st.columns(4)
+        i1.metric("Capacity", f"{spec['Q']:,.0f} meq/L")
+        i2.metric("Bead diameter", f"{spec['dia_um']} um")
+        i3.metric("Matrix", spec["matrix"])
+        i4.metric("Functional group", spec["func"])
+        st.caption(f"{spec['note']}  Capacity on data sheet: {spec['cap_note']}. "
+                   f"Water retention: {spec['wrc']}. Ionic form: {spec['form']}.")
+        if st.button("Load these specifications", type="primary"):
+            st.session_state.Q=spec["Q"]; st.session_state.rb=spec["rb"]
+            st.session_state.EBED=spec["EBED"]
+            st.success(f"Loaded {pick}. Values below updated."); st.rerun()
+        st.caption("Bed porosity defaults to 0.35 where the vendor does not publish it. "
+                   "Values below stay editable after loading.")
+    else:
+        st.caption("Enter specifications manually below.")
+
+    st.divider()
     c1,c2=st.columns(2)
     with c1:
         st.markdown("### Resin")
@@ -382,37 +415,180 @@ elif page == "Bed & flow":
 elif page == "Selectivity data":
     st.title("Selectivity data")
     st.write("Selectivity relative to chloride governs the order species break through. "
-             "Higher values bind more strongly and exhaust later.")
-    rows=[{"Species":k,"Class":d["cls"],"Chain":f"C{d['c']}","MW":f"{d['mw']:.2f}",
-           "Selectivity (KxA)":f"{d['KxA']:,.0f}","MCL ng/L":MCL.get(k) or "none",
-           "Provenance":d["src"]} for k,d in
-          sorted(PFAS_DB.items(),key=lambda x:x[1]["KxA"])]
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+             "Higher values bind more strongly and exhaust later. Every value here is editable "
+             "and feeds straight into the simulator.")
+
+    st.markdown("### Parameters")
+    st.caption("Edit molecular weight, selectivity or MCL directly. Changes apply on the next run.")
+
+    edit_df = pd.DataFrame([
+        {"Species":k, "Class":d["cls"], "Carbons":d["c"], "MW":d["mw"],
+         "Selectivity KxA":d["KxA"],
+         "MCL ng/L":(MCLS.get(k) if MCLS.get(k) is not None else np.nan),
+         "Provenance":d["src"]}
+        for k,d in sorted(DB.items(), key=lambda x:x[1]["KxA"])])
+
+    edited = st.data_editor(edit_df, use_container_width=True, hide_index=True,
+        disabled=["Species","Class","Provenance"], key="sel_editor",
+        column_config={
+          "MW": st.column_config.NumberColumn("MW g/mol", format="%.3f"),
+          "Selectivity KxA": st.column_config.NumberColumn("Selectivity KxA", format="%.0f"),
+          "MCL ng/L": st.column_config.NumberColumn("MCL ng/L", format="%.1f",
+                        help="Leave blank if the species has no regulatory limit"),
+          "Carbons": st.column_config.NumberColumn("Chain C", format="%d"),
+        })
+
+    c1,c2 = st.columns([1,3])
+    with c1:
+        if st.button("Apply changes", type="primary", use_container_width=True):
+            for _,r in edited.iterrows():
+                sp=r["Species"]
+                st.session_state.db[sp]["mw"]=float(r["MW"])
+                st.session_state.db[sp]["KxA"]=float(r["Selectivity KxA"])
+                st.session_state.db[sp]["c"]=int(r["Carbons"])
+                v=r["MCL ng/L"]
+                st.session_state.mcl[sp]=(None if pd.isna(v) else float(v))
+                if abs(float(r["Selectivity KxA"])-PFAS_DB[sp]["KxA"])>1e-6:
+                    st.session_state.db[sp]["src"]="User edited"
+            st.success("Applied. Re-run the simulator to use these values.")
+            st.rerun()
+    with c2:
+        if st.button("Reset to published values", use_container_width=True):
+            st.session_state.db=copy.deepcopy(PFAS_DB)
+            st.session_state.mcl=dict(MCL)
+            st.success("Reset."); st.rerun()
 
     st.markdown("### Provenance")
-    st.write("**EPA measured** — five carboxylates taken directly from EPA's published example "
-             "workbook in Water_Treatment_Models, Shiny-IEX/Examples/example_input_medium.xlsx. "
+    st.write("**EPA measured** - five carboxylates taken directly from EPA's published example "
+             "workbook, Water_Treatment_Models/Shiny-IEX/Examples/example_input_medium.xlsx. "
              "Molecular weights from PSDM/PFAS_properties.xlsx.")
-    st.write("**Derived** — the three sulfonates are set at 100x the same-chain carboxylate. "
+    st.write("**Derived** - the three sulfonates are set at 100x the same-chain carboxylate. "
              "ACS ES&T Water (2023), *Strong Base Anion Exchange Selectivity of Nine "
-             "Perfluoroalkyl Chemicals Relevant to Drinking Water*, reports sulfonate "
-             "selectivity roughly two orders of magnitude above carboxylates at equal chain length.")
-    st.write("**Extrapolated** — PFNA from regression on EPA's own carboxylate series "
-             "(R² = 0.963, 0.403 log10 units per CF2).")
-    st.info("This parameter set reproduces the NEWMOA published breakthrough order exactly: "
-            "PFBA < PFPeA < PFHxA < PFHpA < PFOA < PFNA < PFBS < PFHxS < PFOS. That validates "
-            "ordering. Absolute magnitudes for the derived sulfonates remain unverified against "
-            "column data.")
+             "Perfluoroalkyl Chemicals Relevant to Drinking Water*, reports sulfonate selectivity "
+             "roughly two orders of magnitude above carboxylates at equal chain length.")
+    st.write("**Extrapolated** - PFNA from regression on EPA's own carboxylate series.")
+    st.info("This set reproduces the NEWMOA published breakthrough order exactly: PFBA < PFPeA < "
+            "PFHxA < PFHpA < PFOA < PFNA < PFBS < PFHxS < PFOS. That validates ordering. "
+            "Absolute magnitudes for the derived sulfonates remain unverified against column data.")
 
-    ks=[PFAS_DB[k]["KxA"] for k in PFAS_DB]; ns=list(PFAS_DB.keys())
+    ks=[DB[k]["KxA"] for k in DB]; ns=list(DB.keys())
     o=np.argsort(ks)
     fig=go.Figure(go.Bar(x=[ns[i] for i in o],y=[ks[i] for i in o],
         marker_color=[SERIES[i%len(SERIES)] for i in range(len(ns))]))
-    fig.update_layout(yaxis_type="log",yaxis_title="selectivity vs chloride (log)",
+    fig.update_layout(yaxis_type="log",yaxis_title="selectivity vs chloride (log scale)",
                       height=380,**PLOT)
     st.plotly_chart(fig,use_container_width=True)
 
-# ================= ALKALINITY =================
+elif page == "Selectivity calculator":
+    st.title("Selectivity calculator")
+    st.write("Selectivity is not published for every PFAS on every resin. This estimates it three "
+             "ways: from chain length, from a measured column result, or from a paired reference "
+             "compound. Any result can be written straight into the parameter table.")
+
+    m = st.radio("Method", ["Chain length (LFER)", "From measured bed volumes",
+                            "Scale from a reference species"], horizontal=True)
+    st.divider()
+
+    # ---------- 1. LFER ----------
+    if m == "Chain length (LFER)":
+        st.markdown("### Estimate from molecular structure")
+        st.write("Each added CF2 group raises binding free energy by a near-constant amount, so "
+                 "log selectivity rises linearly with chain length. The relationship below was "
+                 "fitted to EPA's own five-carboxylate series.")
+        st.latex(r"\log_{10}(K_{x/Cl}) = %.3f \cdot n_C + %.3f" % (LFER_SLOPE, LFER_INTERCEPT))
+        st.caption(f"R2 = 0.963 against EPA data. Sulfonates are then multiplied by "
+                   f"{PFSA_FACTOR:.0f}x at equal chain length, per ACS ES&T Water (2023).")
+
+        c1,c2,c3 = st.columns(3)
+        with c1: nC = st.number_input("Perfluorinated carbons", value=8, min_value=2, max_value=16)
+        with c2: head = st.selectbox("Head group", ["PFCA (carboxylate)","PFSA (sulfonate)"])
+        with c3: st.metric("Estimated KxA", f"{estimate_KxA(nC,'PFSA' if 'PFSA' in head else 'PFCA'):,.0f}")
+
+        # fit quality against the species we have real EPA values for
+        st.markdown("### Fit against measured values")
+        rows=[]
+        for k,d in DB.items():
+            est=estimate_KxA(d["c"], "PFSA" if d["cls"]=="PFSA" else "PFCA")
+            rows.append({"Species":k,"Class":d["cls"],"Chain":f"C{d['c']}",
+                         "In table":f"{d['KxA']:,.0f}","LFER estimate":f"{est:,.0f}",
+                         "Ratio":f"{est/d['KxA']:.2f}x","Provenance":d["src"]})
+        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+        st.caption("Ratio near 1.0 means the correlation reproduces the tabulated value. The LFER "
+                   "is a structural estimate, not a substitute for a measured coefficient.")
+
+        cs=np.arange(2,17)
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(x=cs,y=[estimate_KxA(c) for c in cs],mode="lines",
+            name="PFCA (fitted)",line=dict(color="#40E0D0",width=2)))
+        fig.add_trace(go.Scatter(x=cs,y=[estimate_KxA(c,"PFSA") for c in cs],mode="lines",
+            name="PFSA (fitted)",line=dict(color="#8B6FE8",width=2,dash="dash")))
+        for k,d in DB.items():
+            if d["src"]=="EPA measured":
+                fig.add_trace(go.Scatter(x=[d["c"]],y=[d["KxA"]],mode="markers+text",
+                    name=k,text=[k],textposition="top center",showlegend=False,
+                    marker=dict(size=10,color="#FFB454")))
+        fig.update_layout(yaxis_type="log",xaxis_title="perfluorinated carbons",
+                          yaxis_title="selectivity vs chloride",height=420,**PLOT)
+        st.plotly_chart(fig,use_container_width=True)
+        est_val = estimate_KxA(nC,'PFSA' if 'PFSA' in head else 'PFCA')
+
+    # ---------- 2. from measured bed volumes ----------
+    elif m == "From measured bed volumes":
+        st.markdown("### Back-calculate from a column result")
+        st.write("If you have run a column and know how many bed volumes it treated before "
+                 "breakthrough, selectivity can be inferred by comparison against a species whose "
+                 "coefficient is already known, under the same water and bed conditions.")
+        st.info("Bed life scales close to linearly with selectivity over the practical range, "
+                "which is what makes this inversion possible. Verified across a sweep from "
+                "KxA 363 to 36,300 in this model.")
+
+        c1,c2 = st.columns(2)
+        with c1:
+            ref = st.selectbox("Reference species (known KxA)",
+                               [k for k,d in DB.items() if d["src"]=="EPA measured"])
+            bv_ref = st.number_input("Reference bed volumes at breakthrough", value=10827.0, min_value=1.0)
+        with c2:
+            bv_obs = st.number_input("Your measured bed volumes", value=50000.0, min_value=1.0)
+            st.caption("From your own column test or vendor pilot data.")
+
+        est_val = KxA_from_bedvolumes(bv_obs, bv_ref, DB[ref]["KxA"])
+        k1,k2 = st.columns(2)
+        k1.metric("Reference KxA", f"{DB[ref]['KxA']:,.0f}")
+        k2.metric("Implied KxA", f"{est_val:,.0f}" if est_val else "-")
+        st.caption(f"Your column lasted {bv_obs/bv_ref:.2f}x as long as {ref} would under the same "
+                   "conditions, implying proportionally higher selectivity.")
+
+    # ---------- 3. scale from reference ----------
+    else:
+        st.markdown("### Scale from a reference species")
+        st.write("Useful when a vendor reports performance relative to a known compound, or when "
+                 "adapting a coefficient measured on one resin to another.")
+        c1,c2 = st.columns(2)
+        with c1:
+            ref = st.selectbox("Reference species", list(DB.keys()))
+            st.metric("Reference KxA", f"{DB[ref]['KxA']:,.0f}")
+        with c2:
+            factor = st.number_input("Multiplier", value=1.0, min_value=0.0001, format="%.4f")
+            st.caption("e.g. 100 for a sulfonate against its equal-chain carboxylate.")
+        est_val = DB[ref]["KxA"]*factor
+        st.metric("Resulting KxA", f"{est_val:,.0f}")
+
+    # ---------- write back ----------
+    st.divider()
+    st.markdown("### Write to parameter table")
+    w1,w2 = st.columns([2,1])
+    with w1:
+        target = st.selectbox("Assign this value to", list(DB.keys()), key="calc_target")
+    with w2:
+        st.metric("Value to write", f"{est_val:,.0f}" if est_val else "-")
+    if st.button("Write value", type="primary"):
+        if est_val:
+            st.session_state.db[target]["KxA"]=float(est_val)
+            st.session_state.db[target]["src"]="Calculated"
+            st.success(f"{target} selectivity set to {est_val:,.0f}. Re-run the simulator to apply.")
+        else:
+            st.error("No value to write.")
+
 elif page == "Alkalinity converter":
     st.title("Alkalinity to bicarbonate")
     st.write("The model takes bicarbonate in meq/L. Convert from an alkalinity and pH pair here. "
