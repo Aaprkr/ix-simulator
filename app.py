@@ -5,6 +5,89 @@ import plotly.graph_objects as go
 import io
 import sys
 
+# ============================================================
+# EPA-SOURCED PFAS PARAMETERS
+# KxA values from: Water_Treatment_Models/Shiny-IEX/Examples/example_input_medium.xlsx
+# MW values from:  Water_Treatment_Models/PSDM/PFAS_properties.xlsx
+# ============================================================
+PFAS_DB = {
+    "PFBA":  {"mw": 214.039, "KxA": 363.0,   "carbons": 4, "label": "PFBA (C4, short-chain)"},
+    "PFPeA": {"mw": 264.047, "KxA": 513.0,   "carbons": 5, "label": "PFPeA (C5)"},
+    "PFHxA": {"mw": 314.054, "KxA": 1778.0,  "carbons": 6, "label": "PFHxA (C6)"},
+    "PFHpA": {"mw": 364.062, "KxA": 3311.0,  "carbons": 7, "label": "PFHpA (C7)"},
+    "PFOA":  {"mw": 414.070, "KxA": 14791.0, "carbons": 8, "label": "PFOA (C8, long-chain)"},
+}
+
+BACKGROUND_IONS = {
+    "CHLORIDE":    {"mw": 35.45, "KxA": 1.0,   "val": 1, "default": 4.99},
+    "SULFATE":     {"mw": 96.06, "KxA": 0.028, "val": 2, "default": 3.12},
+    "BICARBONATE": {"mw": 12.00, "KxA": 0.370, "val": 1, "default": 3.75},
+    "NITRATE":     {"mw": 14.00, "KxA": 13.0,  "val": 1, "default": 0.714},
+}
+
+
+def _run_multi_pfas(selected, cin_df, Q=1000.0, EBED=0.35, L=14.76, v=0.123,
+                    rb=0.03375, kL=0.0021, nr=7, nz=13, sim_days=400, npts=300):
+    """Multi-component competitive IX using EPA's HSDM engine.
+    Returns (days, bed_volumes, {species: C/C0 array})."""
+    params = pd.DataFrame([
+        {"name": "Q", "value": Q, "units": "meq/L"},
+        {"name": "EBED", "value": EBED, "units": None},
+        {"name": "L", "value": L, "units": "cm"},
+        {"name": "v", "value": v, "units": "cm/s"},
+        {"name": "rb", "value": rb, "units": "cm"},
+        {"name": "kL", "value": kL, "units": "cm/s"},
+        {"name": "Ds", "value": 0.0, "units": "cm2/s"},
+        {"name": "nr", "value": nr, "units": None},
+        {"name": "nz", "value": nz, "units": None},
+        {"name": "time", "value": "day", "units": "day"},
+    ])
+
+    rows = []
+    for n, d in BACKGROUND_IONS.items():
+        rows.append({
+            "name": n, "mw": d["mw"], "KxA": d["KxA"], "valence": d["val"],
+            "kL": 1.0 if n == "CHLORIDE" else 0.0021, "kL_units": "cm/s",
+            "Ds": 1.0 if n == "CHLORIDE" else 2e-7, "Ds_units": "cm^2/s",
+            "Dp": 1.0 if n == "CHLORIDE" else 2e-6, "Dp_units": "cm^2/s",
+            "conc_units": "meq",
+        })
+    for n in selected:
+        d = PFAS_DB[n]
+        rows.append({
+            "name": n, "mw": d["mw"], "KxA": d["KxA"], "valence": 1,
+            "kL": 0.0021, "kL_units": "cm/s",
+            "Ds": 2e-7, "Ds_units": "cm^2/s",
+            "Dp": 2e-6, "Dp_units": "cm^2/s",
+            "conc_units": "ng",
+        })
+    ions = pd.DataFrame(rows)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        params.to_excel(w, sheet_name="params", index=False)
+        ions.to_excel(w, sheet_name="ions", index=False)
+        cin_df.to_excel(w, sheet_name="Cin", index=False)
+    buf.seek(0)
+
+    IEX = hsdmix.HSDMIX(buf)
+    ev = np.linspace(0, sim_days, num=npts)
+    t, u = IEX.solve(t_eval=ev, const_Cin=True)
+    t_days = t / IEX.time_mult
+    names = list(IEX.names)
+
+    curves = {}
+    for n in selected:
+        j = names.index(n)
+        C0_ngL = float(cin_df.iloc[0][n])
+        if C0_ngL <= 0:
+            continue
+        conv = C0_ngL / (PFAS_DB[n]["mw"] * 1e6)
+        curves[n] = u[0, j, -1, :] / conv
+
+    bed_volumes = (v * t_days * 86400) / L
+    return t_days, bed_volumes, curves
+
 sys.path.append('Water_Treatment_Models/IonExchangeModel')
 from ixpy import hsdmix
 from ixpy.paramsheets import conv_length, conv_vel
@@ -84,7 +167,9 @@ uploaded_file = st.file_uploader("Upload a pre-built .xlsx file matching the par
 if uploaded_file is not None:
     st.info("Uploaded file will be used directly when you click Run Simulation, bypassing the form below.")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Column Parameters", "Ions", "Alkalinity", "kL Guesser", "Feasibility Screening"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Column Parameters", "Ions", "Alkalinity", "kL Guesser",
+    "Feasibility Screening", "Multi-PFAS Simulator"])
 
 with tab1:
     st.subheader("Resin Characteristics")
@@ -511,3 +596,143 @@ not a design number. Use the sensitivity chart below to see how much that assump
                             "used for PFAS IX. A deeper bed or larger vessel would raise contact time.")
             except Exception as e:
                 st.error(f"Screening failed: {e}")
+
+# ============================================================
+# TAB 6: MULTI-COMPONENT PFAS SIMULATOR
+# ============================================================
+with tab6:
+    st.subheader("Multi-Component Competitive PFAS Breakthrough")
+    st.markdown("""
+Real utility data reports **many PFAS species at different concentrations**, not one lumped number.
+Each species binds to the resin with a different strength, so they break through at different times.
+Short-chain compounds break through first, and can be **physically displaced** off the resin by
+longer-chain compounds arriving later, pushing their effluent concentration temporarily
+**above the influent** (C/C₀ > 1.0). A single-species model cannot show this.
+
+Select only the species you actually measured. Anything unchecked is excluded from the simulation.
+    """)
+
+    st.success("""**Parameter source.** Selectivity coefficients (KxA) below are taken directly from EPA's own
+published example file (`Shiny-IEX/Examples/example_input_medium.xlsx`) in the Water_Treatment_Models
+repository. Molecular weights are from EPA's `PSDM/PFAS_properties.xlsx`. These are not estimates.""")
+
+    st.markdown("### 1. Select species you measured")
+    sel_cols = st.columns(5)
+    selected = []
+    for i, (key, d) in enumerate(PFAS_DB.items()):
+        with sel_cols[i]:
+            default_on = key in ["PFBA", "PFHxA", "PFOA"]
+            if st.checkbox(d["label"].split(" ")[0], value=default_on, key=f"chk_{key}"):
+                selected.append(key)
+            st.caption(f"C{d['carbons']} · KxA {d['KxA']:,.0f}")
+
+    if not selected:
+        st.info("Select at least one PFAS species above to run a simulation.")
+    else:
+        st.markdown("### 2. Influent concentrations over time")
+        st.caption("Add rows to model changing source water. The final row's time sets the simulation length. "
+                   "PFAS in ng/L (= ppt); background ions in meq/L.")
+
+        mp_cols = ["time"] + list(BACKGROUND_IONS.keys()) + selected
+        if ("mp_cin" not in st.session_state
+                or list(st.session_state.mp_cin.columns) != mp_cols):
+            base = {"time": [0, 400]}
+            for n, d in BACKGROUND_IONS.items():
+                base[n] = [d["default"], d["default"]]
+            for n in selected:
+                base[n] = [20.0, 20.0]
+            st.session_state.mp_cin = pd.DataFrame(base)
+
+        mp_cin = st.data_editor(st.session_state.mp_cin, num_rows="dynamic",
+                                 key="mp_cin_editor", use_container_width=True)
+
+        st.markdown("### 3. Column parameters")
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            mp_Q = st.number_input("Resin capacity Q (meq/L)", value=1000.0, key="mp_Q")
+        with p2:
+            mp_L = st.number_input("Bed depth L (cm)", value=14.76, key="mp_L")
+        with p3:
+            mp_v = st.number_input("Velocity v (cm/s)", value=0.123, key="mp_v")
+        with p4:
+            mp_EBED = st.number_input("Bed porosity", value=0.35, key="mp_EBED")
+
+        x_axis = st.radio("X-axis", ["Bed Volumes (×1000)", "Days"], horizontal=True)
+        bt_pct = st.slider("Breakthrough threshold (% of influent)", 1, 50, 10) / 100.0
+
+        if st.button("Run Multi-Component Simulation", type="primary", key="mp_run"):
+            try:
+                sim_days = float(mp_cin["time"].max())
+                t_days, BV, curves = _run_multi_pfas(
+                    selected, mp_cin, Q=mp_Q, EBED=mp_EBED,
+                    L=mp_L, v=mp_v, sim_days=sim_days)
+
+                if not curves:
+                    st.warning("All selected species have zero influent concentration.")
+                else:
+                    x = BV / 1000 if x_axis.startswith("Bed") else t_days
+                    xlab = "Throughput, 1000 × BV" if x_axis.startswith("Bed") else "Days"
+
+                    fig = go.Figure()
+                    for n in sorted(curves, key=lambda k: PFAS_DB[k]["carbons"]):
+                        fig.add_trace(go.Scatter(
+                            x=x, y=curves[n], mode="lines",
+                            name=f"{n} (C{PFAS_DB[n]['carbons']})"))
+                    fig.add_hline(y=1.0, line_dash="dot", line_color="gray",
+                                   annotation_text="C/C₀ = 1.0 (influent)")
+                    fig.add_hline(y=bt_pct, line_dash="dash", line_color="red",
+                                   annotation_text=f"{bt_pct*100:.0f}% breakthrough")
+                    fig.update_layout(title="Competitive PFAS Breakthrough",
+                                       xaxis_title=xlab, yaxis_title="C/C₀",
+                                       hovermode="x unified", legend_title="Species")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("### Breakthrough summary")
+                    recs = []
+                    for n in sorted(curves, key=lambda k: PFAS_DB[k]["carbons"]):
+                        s = curves[n]
+                        idx = np.where(s >= bt_pct)[0]
+                        if len(idx):
+                            d_bt, bv_bt = t_days[idx[0]], BV[idx[0]]
+                            bt_str = f"{d_bt:,.0f}"
+                            bv_str = f"{bv_bt:,.0f}"
+                        else:
+                            bt_str = f">{sim_days:,.0f}"
+                            bv_str = "—"
+                        recs.append({
+                            "Species": n,
+                            "Chain": f"C{PFAS_DB[n]['carbons']}",
+                            "KxA": f"{PFAS_DB[n]['KxA']:,.0f}",
+                            f"Days to {bt_pct*100:.0f}%": bt_str,
+                            "Bed Volumes": bv_str,
+                            "Peak C/C₀": f"{s.max():.3f}",
+                            "Displacement": "Yes" if s.max() > 1.02 else "No",
+                        })
+                    st.dataframe(pd.DataFrame(recs), use_container_width=True, hide_index=True)
+
+                    over = [n for n, s in curves.items() if s.max() > 1.02]
+                    if over:
+                        st.warning(f"**Chromatographic displacement detected:** {', '.join(over)} "
+                                   "exceeded influent concentration. Longer-chain PFAS are displacing "
+                                   "these weaker-binding species off the resin, so effluent is temporarily "
+                                   "*worse* than raw water for them. This is a real operational risk that "
+                                   "single-species models cannot predict.")
+                    else:
+                        st.info("No significant displacement in this configuration. Overshoot becomes more "
+                                "pronounced with higher competing-ion loading or longer run times.")
+
+                    ordered = sorted(curves, key=lambda k: PFAS_DB[k]["carbons"])
+                    st.caption("Breakthrough order (earliest first): " +
+                               " → ".join(ordered) +
+                               ". This follows chain length: shorter chains bind weakly and break through first.")
+
+                    exp = pd.DataFrame({"Days": t_days, "BedVolumes": BV})
+                    for n, s in curves.items():
+                        exp[f"{n}_C_C0"] = s
+                    b = io.BytesIO()
+                    exp.to_excel(b, index=False, engine="openpyxl")
+                    b.seek(0)
+                    st.download_button("Download Results (Excel)", data=b,
+                                        file_name="multi_pfas_breakthrough.xlsx", key="mp_dl")
+            except Exception as e:
+                st.error(f"Simulation failed: {e}")
