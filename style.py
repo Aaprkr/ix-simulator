@@ -78,9 +78,45 @@ div[data-testid="stExpander"] {
 }
 div[data-testid="stAlert"] { border-radius: 10px; }
 #MainMenu, footer { visibility: hidden; }
-header[data-testid="stHeader"] { background: transparent !important; height: 0 !important; }
-div[data-testid="stToolbar"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; }
+div[data-testid="stToolbar"] { visibility: hidden; }
+div[data-testid="stToolbar"] button[data-testid="stExpandSidebarButton"] { visibility: visible !important; }
 div[data-testid="stDecoration"] { display: none !important; }
+/* sidebar collapse / expand control - must stay visible on dark bg */
+button[data-testid="stBaseButton-headerNoPadding"] {
+    background: rgba(64,224,208,0.16) !important;
+    border: 1px solid rgba(64,224,208,0.45) !important;
+    border-radius: 9px !important;
+    color: #40E0D0 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    padding: 4px 7px !important;
+    transition: background 0.15s ease;
+}
+button[data-testid="stBaseButton-headerNoPadding"]:hover {
+    background: rgba(64,224,208,0.30) !important;
+}
+button[data-testid="stBaseButton-headerNoPadding"] span,
+button[data-testid="stBaseButton-headerNoPadding"] svg {
+    color: #40E0D0 !important;
+    fill: #40E0D0 !important;
+    opacity: 1 !important;
+}
+[data-testid="stSidebarCollapseButton"] { opacity: 1 !important; visibility: visible !important; }
+[data-testid="stSidebarCollapsedControl"] { opacity: 1 !important; visibility: visible !important; z-index: 999 !important; }
+/* stToolbar is hidden above; the expand control lives near it, force it back */
+button[data-testid="stExpandSidebarButton"] {
+    display: flex !important; visibility: visible !important; opacity: 1 !important;
+    background: rgba(64,224,208,0.16) !important;
+    border: 1px solid rgba(64,224,208,0.45) !important;
+    border-radius: 9px !important;
+    z-index: 1000 !important;
+}
+button[data-testid="stExpandSidebarButton"]:hover { background: rgba(64,224,208,0.32) !important; }
+button[data-testid="stExpandSidebarButton"] span,
+button[data-testid="stExpandSidebarButton"] svg {
+    color: #40E0D0 !important; fill: #40E0D0 !important; opacity: 1 !important;
+}
 </style>
 """
 
