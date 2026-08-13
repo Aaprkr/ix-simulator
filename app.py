@@ -5,7 +5,8 @@ import plotly.graph_objects as go
 sys.path.append('Water_Treatment_Models/IonExchangeModel')
 from ixpy import hsdmix
 from ixpy.paramsheets import conv_length, conv_vel
-from core import PFAS_DB, BG_IONS, MCL, CARY, simulate, analyze
+from core import (PFAS_DB, BG_IONS, MCL, CARY, simulate, analyze,
+                  bed_life, solve_depth, sweep_depth)
 from style import CSS, PLOT, SERIES
 
 st.set_page_config(page_title="Breakthrough", page_icon="~", layout="wide")
@@ -25,7 +26,9 @@ with st.sidebar:
     st.markdown("## Breakthrough")
     st.caption("PFAS ion exchange modelling on the EPA HSDM engine")
     page = st.radio("Section", [
+        "Dashboard",
         "Simulator",
+        "Design solver",
         "Bed & flow",
         "Selectivity data",
         "Alkalinity converter",
@@ -42,8 +45,176 @@ with st.sidebar:
     ebct = bedL/(st.session_state.flow_gpm*3.785)
     st.caption(f"volume {bedL:,.0f} L · EBCT {ebct:.2f} min")
 
+# ================= DASHBOARD =================
+if page == "Dashboard":
+    st.title("Overview")
+    bedL = np.pi*(st.session_state.diam/2)**2*st.session_state.L/1000
+    ebct = bedL/(st.session_state.flow_gpm*3.785)
+
+    if "res" not in st.session_state:
+        st.info("No simulation run yet. Open the Simulator, choose your species and influent, "
+                "then return here for the summary.")
+        st.markdown("### Current bed")
+        a,b,c,d = st.columns(4)
+        a.metric("Bed volume", f"{bedL:,.0f} L")
+        b.metric("EBCT", f"{ebct:.2f} min")
+        c.metric("Bed depth", f"{st.session_state.L:.1f} cm")
+        d.metric("Flow", f"{st.session_state.flow_gpm:.0f} gpm")
+        st.stop()
+
+    td, BV, curves, cin_used = st.session_state.res
+    thr = st.session_state.thresh/100
+    recs, first, fsp = analyze(curves, td, BV, cin_used, thr)
+
+    st.markdown("### Compliance")
+    # MCL status per regulated species
+    reg = [n for n in curves if MCL.get(n)]
+    cols = st.columns(max(len(reg),1)) if reg else [st]
+    for col,n in zip(cols,reg):
+        C0 = float(cin_used.iloc[0][n]); m = MCL[n]
+        s = curves[n]; mi = np.where(s*C0 >= m)[0]
+        if C0 >= m and len(mi)==0:
+            col.metric(n, "compliant", f"raw {C0:.1f} > MCL {m:.0f}", delta_color="off")
+        elif len(mi):
+            col.metric(n, f"{td[mi[0]]:,.0f} d", f"until MCL {m:.0f} ppt", delta_color="inverse")
+        else:
+            col.metric(n, "holds", f"MCL {m:.0f} ppt", delta_color="normal")
+
+    st.divider()
+    st.markdown("### Bed status")
+    a,b,c,d = st.columns(4)
+    if fsp:
+        bv_lim=(st.session_state.v*first*86400)/st.session_state.L
+        a.metric("Limiting species", fsp)
+        b.metric("Bed life", f"{first:,.0f} d")
+        c.metric("Bed volumes", f"{bv_lim:,.0f}")
+        charge=bedL*st.session_state.cost
+        d.metric("Annual media", f"${charge*(365/first):,.0f}")
+    else:
+        a.metric("Limiting species", "none")
+        b.metric("Bed life", f">{td[-1]:,.0f} d")
+        c.metric("Bed volume", f"{bedL:,.0f} L")
+        d.metric("EBCT", f"{ebct:.2f} min")
+
+    # compliance timeline
+    st.markdown("### Breakthrough timeline")
+    st.caption(f"When each species reaches {st.session_state.thresh}% of influent.")
+    tl=[]
+    for n in sorted(curves,key=lambda k:PFAS_DB[k]["KxA"]):
+        s=curves[n]; i=np.where(s>=thr)[0]
+        tl.append((n, td[i[0]] if len(i) else None))
+    reached=[(n,d) for n,d in tl if d is not None]
+    if reached:
+        fig=go.Figure()
+        fig.add_trace(go.Bar(
+            y=[n for n,_ in reached], x=[d for _,d in reached], orientation='h',
+            marker_color=[SERIES[i%len(SERIES)] for i in range(len(reached))],
+            text=[f"{d:,.0f} d" for _,d in reached], textposition="outside"))
+        fig.update_layout(xaxis_title="days to breakthrough", yaxis_title="",
+                          height=60+38*len(reached), showlegend=False, **PLOT)
+        st.plotly_chart(fig,use_container_width=True)
+    never=[n for n,d in tl if d is None]
+    if never:
+        st.success(f"No breakthrough within the simulated window: {', '.join(never)}")
+
+# ================= DESIGN SOLVER =================
+elif page == "Design solver":
+    st.title("Design solver")
+    st.write("Works the problem backwards. Instead of asking how long a bed lasts, set the bed "
+             "life you need and solve for the depth required to reach it.")
+
+    if "cin" not in st.session_state:
+        st.info("Set up species and influent in the Simulator first.")
+        st.stop()
+    cin = st.session_state.cin
+    selected = [c for c in cin.columns if c in PFAS_DB]
+    if not selected:
+        st.info("No PFAS species in the current influent. Configure them in the Simulator.")
+        st.stop()
+
+    st.caption(f"Solving for: {', '.join(selected)}  ·  threshold "
+               f"{st.session_state.thresh}% of influent")
+
+    c1,c2 = st.columns(2)
+    with c1:
+        target = st.number_input("Target bed life · days", value=365.0, min_value=1.0)
+        st.caption("365 = annual changeout. 180 = twice yearly.")
+    with c2:
+        maxL = st.number_input("Maximum vessel depth · cm", value=400.0, min_value=10.0)
+        st.caption("Solver will not exceed this.")
+
+    if st.button("Solve for depth", type="primary"):
+        with st.spinner("Running iterative solve, takes 30-60 seconds"):
+            kw = dict(Q=st.session_state.Q, EBED=st.session_state.EBED,
+                      v=st.session_state.v, rb=st.session_state.rb,
+                      kL=st.session_state.kL, nr=st.session_state.nr,
+                      nz=st.session_state.nz, thresh=st.session_state.thresh/100)
+            try:
+                L_req, achieved, sp, ok = solve_depth(selected, cin, target, hi=maxL, **kw)
+            except Exception as e:
+                st.error(f"Solver failed: {e}"); st.stop()
+
+        if L_req is None:
+            st.error(f"Cannot reach {target:,.0f} days within {maxL:,.0f} cm. "
+                     f"Deepest bed tested gives {achieved:,.0f} days, limited by {sp}. "
+                     "Increase maximum depth, or reduce flow velocity in Bed & flow.")
+        else:
+            bedL_req = np.pi*(st.session_state.diam/2)**2*L_req/1000
+            ebct_req = bedL_req/(st.session_state.flow_gpm*3.785)
+            a,b,c,d = st.columns(4)
+            a.metric("Required depth", f"{L_req:,.1f} cm")
+            b.metric("Achieved life", f"{achieved:,.0f} d" if achieved else "no breakthrough")
+            c.metric("Resin volume", f"{bedL_req:,.0f} L")
+            d.metric("EBCT", f"{ebct_req:.2f} min")
+            st.caption(f"Limited by {sp}. Current bed is {st.session_state.L:.1f} cm "
+                       f"({L_req/st.session_state.L:.1f}x change required).")
+            if not ok:
+                st.warning("Solver hit its iteration limit. Treat the depth as approximate.")
+            cost_req = bedL_req*st.session_state.cost
+            bedL_now = np.pi*(st.session_state.diam/2)**2*st.session_state.L/1000
+            cost_now = bedL_now*st.session_state.cost
+            if achieved:
+                st.info(f"Resin charge \\${cost_req:,.0f} at the solved depth "
+                        f"(\\${cost_req*(365/achieved):,.0f} per year) "
+                        f"against \\${cost_now:,.0f} for the current bed.")
+
+    st.divider()
+    st.markdown("### Depth sweep")
+    st.caption("Bed life across a range of depths, so you can see the trade directly.")
+    s1,s2,s3 = st.columns(3)
+    with s1: d_lo=st.number_input("From · cm",value=10.0,min_value=1.0)
+    with s2: d_hi=st.number_input("To · cm",value=200.0,min_value=2.0)
+    with s3: d_n=st.slider("Points",3,10,6)
+
+    if st.button("Run sweep"):
+        with st.spinner(f"Running {d_n} simulations, allow ~{d_n*6} seconds"):
+            kw = dict(Q=st.session_state.Q, EBED=st.session_state.EBED,
+                      v=st.session_state.v, rb=st.session_state.rb,
+                      kL=st.session_state.kL, nr=st.session_state.nr,
+                      nz=st.session_state.nz, thresh=st.session_state.thresh/100)
+            try:
+                pts = sweep_depth(selected, cin, np.linspace(d_lo,d_hi,d_n), **kw)
+            except Exception as e:
+                st.error(f"Sweep failed: {e}"); st.stop()
+        got=[(L,d) for L,d,_ in pts if d is not None]
+        if got:
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=[L for L,_ in got],y=[d for _,d in got],
+                mode="lines+markers",line=dict(color="#40E0D0",width=2.4),
+                marker=dict(size=8)))
+            fig.update_layout(xaxis_title="bed depth · cm",yaxis_title="bed life · days",
+                              height=400,**PLOT)
+            st.plotly_chart(fig,use_container_width=True)
+            tbl=pd.DataFrame([{"Depth cm":f"{L:,.1f}",
+                               "Bed life days":f"{d:,.0f}" if d else "no breakthrough",
+                               "Resin L":f"{np.pi*(st.session_state.diam/2)**2*L/1000:,.0f}",
+                               "Limiting":sp or "-"} for L,d,sp in pts])
+            st.dataframe(tbl,use_container_width=True,hide_index=True)
+        else:
+            st.warning("No breakthrough at any depth tested. Widen the range or extend run time.")
+
 # ================= SIMULATOR =================
-if page == "Simulator":
+elif page == "Simulator":
     st.title("Competitive PFAS breakthrough")
     st.write("Each PFAS binds the resin with different strength, so they exhaust at different "
              "times. Short chains break through first and can be displaced off the resin by "
@@ -152,7 +323,7 @@ if page == "Simulator":
             k1.metric("Resin charge",f"${charge:,.0f}")
             k2.metric("Annual media",f"${annual:,.0f}")
             k3.metric("Per 1000 gal",f"${1000*annual/gal:.3f}")
-            st.caption(f"Bed {bedL:,.0f} L at ${st.session_state.cost:.0f}/L, treating "
+            st.caption(f"Bed {bedL:,.0f} L at \\${st.session_state.cost:.0f}/L, treating "
                        f"{gal:,.0f} gal/yr. Media only — excludes vessels, installation, "
                        "labour and spent-resin disposal.")
             bv_lim=(st.session_state.v*first*86400)/st.session_state.L
