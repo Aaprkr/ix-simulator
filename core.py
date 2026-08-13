@@ -28,8 +28,52 @@ MCL = {"PFOA":4.0,"PFOS":4.0,"PFHxS":10.0,"PFNA":10.0,
 CARY = {"PFBA":18.1,"PFPeA":11.0,"PFHxA":11.0,"PFHpA":4.9,"PFOA":7.4,
         "PFNA":0.0,"PFBS":5.1,"PFHxS":3.4,"PFOS":11.0}
 
+
+# ============================================================
+# RESIN PRESETS - all values from manufacturer product data sheets
+# CalRes 2301   : Calgon Carbon PDS (macroporous, tributylamine)
+# AmberLite PSR2 Plus : DuPont Form No. 45-D00899-en Rev.3 Feb 2025
+# Purofine PFA694E    : Purolite PDS Oct 7 2022
+# ============================================================
+RESINS = {
+ "Custom / manual entry": None,
+ "CalRes 2301 (Calgon Carbon)": {
+    "Q": 510.0, "rb": 0.0290, "EBED": 0.35,
+    "matrix": "Macroporous", "func": "Tributylamine", "form": "Chloride",
+    "dia_um": 580, "cap_note": "min 0.51 eq/L", "wrc": "48-60 wt%",
+    "note": "Only PFAS resin the vendor recommends for surface water; tolerates low-level chlorine disinfection."},
+ "AmberLite PSR2 Plus (DuPont)": {
+    "Q": 700.0, "rb": 0.0350, "EBED": 0.35,
+    "matrix": "Gel", "func": "Quaternary amine", "form": "Chloride",
+    "dia_um": 700, "cap_note": "min 0.7 eq/L", "wrc": "25-35%",
+    "note": "Uniform particle size, UC <=1.1. Shipping density 690 g/L. NSF/ANSI/CAN 61 certified."},
+ "Purofine PFA694E (Purolite)": {
+    "Q": 700.0, "rb": 0.03375, "EBED": 0.35,
+    "matrix": "Gel", "func": "Complex amino", "form": "Chloride",
+    "dia_um": 675, "cap_note": "not published on PDS - 0.7 assumed", "wrc": "n/a",
+    "note": "Mean diameter 675 +/- 75 um, UC max 1.3, SG 1.05. Capacity not published; verify with vendor."},
+}
+
+# LFER fitted to EPA's own PFCA selectivity series (R2 = 0.963)
+LFER_SLOPE = 0.403      # log10 units per CF2
+LFER_INTERCEPT = 0.824
+PFSA_FACTOR = 100.0     # sulfonate vs carboxylate at equal chain, ACS ES&T Water 2023
+
+def estimate_KxA(carbons, head="PFCA"):
+    """Estimate selectivity from chain length using the LFER fitted to EPA data."""
+    k = 10 ** (LFER_SLOPE * carbons + LFER_INTERCEPT)
+    return k * PFSA_FACTOR if head == "PFSA" else k
+
+def KxA_from_bedvolumes(bv_observed, bv_reference, KxA_reference):
+    """Back-calculate selectivity from an observed bed-volume result.
+    Bed life scales close to linearly with KxA over the practical range."""
+    if bv_reference <= 0 or KxA_reference <= 0: return None
+    return KxA_reference * (bv_observed / bv_reference)
+
+
 def simulate(selected, cin_df, Q=1000.0, EBED=0.35, L=14.76, v=0.123,
-             rb=0.03375, kL=0.0021, nr=7, nz=13, npts=400):
+             rb=0.03375, kL=0.0021, nr=7, nz=13, npts=400, db=None):
+    db = db or PFAS_DB
     params = pd.DataFrame([
         {"name":"Q","value":Q,"units":"meq/L"},
         {"name":"EBED","value":EBED,"units":None},
@@ -48,7 +92,7 @@ def simulate(selected, cin_df, Q=1000.0, EBED=0.35, L=14.76, v=0.123,
             "Ds":1.0 if n=="CHLORIDE" else 2e-7,"Ds_units":"cm^2/s",
             "Dp":1.0 if n=="CHLORIDE" else 2e-6,"Dp_units":"cm^2/s","conc_units":"meq"})
     for n in selected:
-        d=PFAS_DB[n]
+        d=db[n]
         rows.append({"name":n,"mw":d["mw"],"KxA":d["KxA"],"valence":1,
             "kL":0.0021,"kL_units":"cm/s","Ds":2e-7,"Ds_units":"cm^2/s",
             "Dp":2e-6,"Dp_units":"cm^2/s","conc_units":"ng"})
@@ -66,13 +110,15 @@ def simulate(selected, cin_df, Q=1000.0, EBED=0.35, L=14.76, v=0.123,
     for n in selected:
         C0=float(cin_df.iloc[0][n])
         if C0<=0: continue
-        curves[n]=u[0,names.index(n),-1,:]/(C0/(PFAS_DB[n]["mw"]*1e6))
+        curves[n]=u[0,names.index(n),-1,:]/(C0/(db[n]["mw"]*1e6))
     return td,(v*td*86400)/L,curves
 
-def analyze(curves, td, BV, cin_df, thresh):
+def analyze(curves, td, BV, cin_df, thresh, db=None, mcl=None):
+    db = db or PFAS_DB
+    mcl = mcl if mcl is not None else MCL
     """Returns per-species breakthrough records and the limiting species."""
     recs=[]; first=None; first_sp=None
-    for n in sorted(curves,key=lambda k:PFAS_DB[k]["KxA"]):
+    for n in sorted(curves,key=lambda k:db[k]["KxA"]):
         s=curves[n]; C0=float(cin_df.iloc[0][n])
         i=np.where(s>=thresh)[0]
         if len(i):
@@ -80,12 +126,12 @@ def analyze(curves, td, BV, cin_df, thresh):
             if first is None or d<first: first,first_sp=d,n
             ds,bs=f"{d:,.0f}",f"{b:,.0f}"
         else: ds,bs="not reached","-"
-        m=MCL.get(n); mh="no limit"
+        m=mcl.get(n); mh="no limit"
         if m and C0>0:
             mi=np.where(s*C0>=m)[0]
             mh=f"{td[mi[0]]:,.0f}" if len(mi) else "not reached"
-        recs.append({"Species":n,"Class":PFAS_DB[n]["cls"],"Chain":f"C{PFAS_DB[n]['c']}",
-            "Influent ppt":f"{C0:.1f}","Selectivity":f"{PFAS_DB[n]['KxA']:,.0f}",
+        recs.append({"Species":n,"Class":db[n]["cls"],"Chain":f"C{db[n]['c']}",
+            "Influent ppt":f"{C0:.1f}","Selectivity":f"{db[n]['KxA']:,.0f}",
             "Days to threshold":ds,"Bed volumes":bs,"Days to MCL":mh,
             "Peak C/C0":f"{s.max():.3f}","Displaced":"yes" if s.max()>1.02 else "no"})
     return recs, first, first_sp
