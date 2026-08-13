@@ -89,3 +89,64 @@ def analyze(curves, td, BV, cin_df, thresh):
             "Days to threshold":ds,"Bed volumes":bs,"Days to MCL":mh,
             "Peak C/C0":f"{s.max():.3f}","Displaced":"yes" if s.max()>1.02 else "no"})
     return recs, first, first_sp
+
+
+def bed_life(selected, cin_df, L, **kw):
+    """Bed life in days for a given bed depth. Returns (days, limiting_species) or (None, None)."""
+    thr = kw.pop("thresh", 0.10)
+    td, BV, curves = simulate(selected, cin_df, L=L, **kw)
+    first = None; sp = None
+    for n, s in curves.items():
+        i = np.where(s >= thr)[0]
+        if len(i) and (first is None or td[i[0]] < first):
+            first, sp = td[i[0]], n
+    return first, sp
+
+
+def solve_depth(selected, cin_df, target_days, lo=5.0, hi=400.0, tol=0.05,
+                max_iter=6, **kw):
+    """Inverse solve: bed depth L that delivers target_days of bed life.
+
+    Bed life is very close to linear in depth, so rather than blind bisection we
+    take one reference run, extrapolate linearly, then refine. Typically converges
+    in 3-4 solver calls instead of ~18.
+    Returns (depth_cm, achieved_days, limiting_species, converged).
+    """
+    kw = dict(kw); kw["npts"] = kw.get("npts", 150)   # coarser grid while searching
+
+    L_ref = 30.0
+    d_ref, sp = bed_life(selected, cin_df, L_ref, **kw)
+    if d_ref is None or d_ref <= 0:
+        # nothing breaks through even at a shallow bed
+        return lo, None, sp, True
+
+    L = L_ref * (target_days / d_ref)                 # linear first guess
+    L = float(np.clip(L, lo, hi))
+    best = (L, d_ref, sp)
+
+    for _ in range(max_iter):
+        d, sp = bed_life(selected, cin_df, L, **kw)
+        if d is None:                                  # overshot into no-breakthrough
+            hi = L; L = max(lo, L * 0.75); continue
+        best = (L, d, sp)
+        err = (d - target_days) / target_days
+        if abs(err) < tol:
+            return L, d, sp, True
+        L_new = float(np.clip(L * (target_days / d), lo, hi))
+        if abs(L_new - L) < 0.5:
+            break
+        L = L_new
+        if L >= hi * 0.999:                            # pinned at ceiling
+            d, sp = bed_life(selected, cin_df, hi, **kw)
+            if d is not None and d < target_days:
+                return None, d, sp, False
+    return best[0], best[1], best[2], False
+
+
+def sweep_depth(selected, cin_df, depths, **kw):
+    """Bed life across a range of depths. Returns list of (depth, days, species)."""
+    out = []
+    for L in depths:
+        d, sp = bed_life(selected, cin_df, L, **kw)
+        out.append((L, d, sp))
+    return out
