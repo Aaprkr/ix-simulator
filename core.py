@@ -196,3 +196,38 @@ def sweep_depth(selected, cin_df, depths, **kw):
         d, sp = bed_life(selected, cin_df, L, **kw)
         out.append((L, d, sp))
     return out
+
+
+# ============================================================
+#  LEAD-LAG  (two vessels in series, standard IX practice)
+# ============================================================
+def lead_lag_life(selected, cin_df, thresh, **kw):
+    """Lead-lag operation: two vessels in series. The lag vessel polishes the
+    lead's effluent, so the lead can run to full exhaustion before changeout.
+    Usable throughput is set by when the LAG effluent crosses the threshold.
+    Modelled as a single bed of twice the depth, which is the standard
+    simplification for two identical vessels in series."""
+    L1 = kw.pop("L", 14.76)
+    td, BV, c = simulate(selected, cin_df, L=L1, **kw)
+    _, single, sp1 = analyze(c, td, BV, cin_df, thresh, db=kw.get("db"))
+    td2, BV2, c2 = simulate(selected, cin_df, L=L1*2, **kw)
+    _, dual, sp2 = analyze(c2, td2, BV2, cin_df, thresh, db=kw.get("db"))
+    return {"single_days": single, "single_sp": sp1,
+            "leadlag_days": dual, "leadlag_sp": sp2,
+            "gain": (dual/single) if (single and dual) else None}
+
+
+def mass_captured(curves, td, cin_df, flow_gpm, db=None):
+    """Total contaminant mass retained on the resin over the run, in grams.
+    Integrates (influent - effluent) x flow over time."""
+    db = db or PFAS_DB
+    L_per_day = flow_gpm * 3.785 * 60 * 24
+    out = {}
+    for n, s in curves.items():
+        C0 = float(cin_df.iloc[0][n])          # ng/L
+        removed_ngL = C0 * (1.0 - np.clip(s, 0, None))
+        # trapezoidal integration over days -> ng, then to grams
+        ng = np.trapezoid(removed_ngL, td) * L_per_day if hasattr(np, "trapezoid") \
+             else np.trapz(removed_ngL, td) * L_per_day
+        out[n] = ng / 1e9
+    return out
