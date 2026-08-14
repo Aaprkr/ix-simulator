@@ -5,12 +5,13 @@ import plotly.graph_objects as go
 sys.path.append('Water_Treatment_Models/IonExchangeModel')
 from ixpy import hsdmix
 from ixpy.paramsheets import conv_length, conv_vel
-import copy
+import copy, json
 from core import (PFAS_DB, BG_IONS, MCL, CARY, simulate, analyze,
                   bed_life, solve_depth, sweep_depth, RESINS,
                   estimate_KxA, KxA_from_bedvolumes,
                   LFER_SLOPE, LFER_INTERCEPT, PFSA_FACTOR)
 from style import CSS, PLOT, SERIES
+import flowsheet
 
 st.set_page_config(page_title="Breakthrough", page_icon="~", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
@@ -36,6 +37,7 @@ with st.sidebar:
     st.caption("PFAS ion exchange modelling on the EPA HSDM engine")
     page = st.radio("Section", [
         "Dashboard",
+        "Flowsheet",
         "Simulator",
         "Design solver",
         "Bed & flow",
@@ -43,7 +45,41 @@ with st.sidebar:
         "Selectivity calculator",
         "Alkalinity converter",
         "Film transfer estimator",
+        "About",
     ], label_visibility="collapsed")
+
+    st.divider()
+    st.markdown("###### Project file")
+    st.caption("Save every input to a file, reload it later or send it to a colleague.")
+
+    _proj = {
+        "schema": "breakthrough-v1",
+        "bed": {k: st.session_state.get(k) for k in
+                ["Q","EBED","L","v","rb","kL","nr","nz","diam","flow_gpm","cost","thresh"]},
+        "db": st.session_state.db,
+        "mcl": st.session_state.mcl,
+        "influent": (st.session_state.cin.to_dict("list")
+                     if "cin" in st.session_state else None),
+    }
+    st.download_button("Save project", json.dumps(_proj, indent=2),
+                       file_name="heliopure_project.json", mime="application/json",
+                       use_container_width=True)
+
+    _up = st.file_uploader("Load project", type=["json"], label_visibility="collapsed")
+    if _up is not None and st.button("Apply loaded file", use_container_width=True):
+        try:
+            d = json.load(_up)
+            if d.get("schema") != "breakthrough-v1":
+                st.error("Not a Breakthrough project file.")
+            else:
+                for k, v in (d.get("bed") or {}).items():
+                    if v is not None: st.session_state[k] = v
+                if d.get("db"): st.session_state.db = d["db"]
+                if d.get("mcl"): st.session_state.mcl = d["mcl"]
+                if d.get("influent"): st.session_state.cin = pd.DataFrame(d["influent"])
+                st.success("Project loaded."); st.rerun()
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
 
     st.divider()
     st.markdown("###### Current bed")
@@ -128,6 +164,9 @@ if page == "Dashboard":
         st.success(f"No breakthrough within the simulated window: {', '.join(never)}")
 
 # ================= DESIGN SOLVER =================
+elif page == "Flowsheet":
+    flowsheet.render()
+
 elif page == "Design solver":
     st.title("Design solver")
     st.write("Works the problem backwards. Instead of asking how long a bed lasts, set the bed "
@@ -292,7 +331,7 @@ elif page == "Simulator":
             m2.metric("Bed life",f"{first:,.0f} d")
             m3.metric("Bed volumes",f"{bv_lim:,.0f}")
             m4.metric("Changeouts/yr",f"{365/first:.2f}")
-            st.caption(f"{fsp} governs changeout — it reaches "
+            st.caption(f"{fsp} governs changeout. It reaches "
                        f"{st.session_state.thresh}% of influent before any other species.")
         else:
             st.success(f"No species reached {st.session_state.thresh}% within "
@@ -318,7 +357,7 @@ elif page == "Simulator":
 
         over=[n for n,s in curves.items() if s.max()>1.02]
         if over:
-            st.warning(f"Chromatographic displacement — {', '.join(over)} exceeded influent "
+            st.warning(f"Chromatographic displacement. {', '.join(over)} exceeded influent "
                        "concentration. Stronger-binding species are stripping these off the resin, "
                        "so effluent is briefly worse than raw water for them.")
 
@@ -334,16 +373,16 @@ elif page == "Simulator":
             k2.metric("Annual media",f"${annual:,.0f}")
             k3.metric("Per 1000 gal",f"${1000*annual/gal:.3f}")
             st.caption(f"Bed {bedL:,.0f} L at \\${st.session_state.cost:.0f}/L, treating "
-                       f"{gal:,.0f} gal/yr. Media only — excludes vessels, installation, "
+                       f"{gal:,.0f} gal/yr. Media only, excludes vessels, installation, "
                        "labour and spent-resin disposal.")
             bv_lim=(st.session_state.v*first*86400)/st.session_state.L
             if bv_lim<20000:
-                st.error("Short bed life. Sulfate and nitrate compete for the same sites — "
+                st.error("Short bed life. Sulfate and nitrate compete for the same sites, "
                          "check background anion levels.")
             elif bv_lim<50000:
                 st.warning("Below the range published PFAS column studies report. Pilot advised.")
             else:
-                st.success("Within the 50,000–300,000 bed volume range published studies report.")
+                st.success("Within the 50,000-300,000 bed volume range published studies report.")
 
         exp=pd.DataFrame({"days":td,"bed_volumes":BV})
         for n,s in curves.items():
@@ -408,7 +447,7 @@ elif page == "Bed & flow":
     m2.metric("EBCT",f"{ebct:.2f} min")
     m3.metric("Loading rate",f"{st.session_state.v*60:.1f} cm/min")
     if ebct<2.0:
-        st.info(f"EBCT of {ebct:.2f} min sits below the 2–5 min range typical for PFAS ion "
+        st.info(f"EBCT of {ebct:.2f} min sits below the 2-5 min range typical for PFAS ion "
                 "exchange. A deeper bed or wider vessel increases contact time.")
 
 # ================= SELECTIVITY DATA =================
@@ -589,6 +628,83 @@ elif page == "Selectivity calculator":
         else:
             st.error("No value to write.")
 
+elif page == "About":
+    st.title("About Breakthrough")
+    st.write("A multi-component PFAS ion exchange breakthrough simulator built on the "
+             "United States Environmental Protection Agency's Homogeneous Surface Diffusion "
+             "Model. The transport physics is EPA's own published code, called directly and "
+             "unmodified. This application supplies the interface, the parameter database, "
+             "and the engineering calculations built on top of the model output.")
+
+    st.markdown("### What the model does")
+    st.write("Given the PFAS species present in a source water, their concentrations, and the "
+             "geometry of an ion exchange vessel, the model predicts how effluent concentration "
+             "rises over time as the resin exhausts. Each species competes for the same finite "
+             "set of exchange sites, so they break through in order of binding strength. "
+             "Short-chain compounds break through first and can be displaced off the resin by "
+             "longer-chain compounds arriving later, driving their effluent concentration "
+             "temporarily above the influent. A single-species model cannot reproduce that "
+             "behaviour.")
+    st.write("The operational answer is breakthrough time: the day effluent first crosses a "
+             "chosen threshold or regulatory limit. Bed volumes, changeout frequency and media "
+             "cost all follow from that one number.")
+
+    st.markdown("### Engine")
+    st.write("United States Environmental Protection Agency, Water Treatment Models, "
+             "Ion Exchange Model (ixpy). Multi-component HSDM solved by orthogonal collocation.")
+    st.code("github.com/USEPA/Water_Treatment_Models", language=None)
+
+    st.markdown("### Parameter sources")
+    st.write("**Selectivity, five carboxylates.** PFBA, PFPeA, PFHxA, PFHpA and PFOA are taken "
+             "directly from EPA's published example workbook, Shiny-IEX / Examples / "
+             "example_input_medium.xlsx.")
+    st.write("**Molecular weights.** EPA, PSDM / PFAS_properties.xlsx.")
+    st.write("**Selectivity, three sulfonates.** PFBS, PFHxS and PFOS are set at one hundred "
+             "times the same-chain-length carboxylate, following the finding that sulfonate "
+             "selectivity runs roughly two orders of magnitude above carboxylates at equal "
+             "chain length, reported in ACS ES&T Water (2023), Strong Base Anion Exchange "
+             "Selectivity of Nine Perfluoroalkyl Chemicals Relevant to Drinking Water. "
+             "These are derived, not measured.")
+    st.write("**Selectivity, PFNA.** Extrapolated from a log-linear regression fitted to EPA's "
+             "own carboxylate series, R-squared 0.963, 0.403 log units per CF2 group.")
+    st.write("**Resin specifications.** Manufacturer product data sheets: Calgon Carbon "
+             "CalRes 2301, DuPont AmberLite PSR2 Plus (Form 45-D00899-en Rev. 3, February 2025), "
+             "Purolite Purofine PFA694E (October 2022). Purolite does not publish total exchange "
+             "capacity for PFA694E; a placeholder is used and flagged in the application.")
+    st.write("**Alkalinity conversion.** Carbonate equilibrium constants matching EPA's own "
+             "implementation. **Film transfer coefficient.** Gnielinski correlation with "
+             "Hayduk-Laudie diffusivity, matching EPA's calculator.")
+    st.write("**Regulatory limits.** United States EPA PFAS National Primary Drinking Water "
+             "Regulation, 2024.")
+
+    st.markdown("### Validation")
+    st.success("The parameter set reproduces the published PFAS breakthrough order from "
+               "NEWMOA's ion exchange case history review exactly: PFBA, PFPeA, PFHxA, PFHpA, "
+               "PFOA, PFNA, PFBS, PFHxS, PFOS. That validates ordering. Absolute bed-volume "
+               "magnitudes for the derived sulfonate values have not been checked against "
+               "column data.")
+
+    st.markdown("### Limitations")
+    st.warning("This is a screening tool. It does not replace pilot testing.\n\n"
+               "Derived and extrapolated selectivity values carry real uncertainty. Cost "
+               "figures cover resin media only and exclude vessels, installation, labour and "
+               "spent-resin disposal. Fouling by natural organic matter, resin degradation "
+               "over multiple cycles, and temperature variation are not modelled. Results "
+               "should be confirmed against vendor data and site-specific testing before "
+               "any design decision.")
+
+    st.markdown("### Saving work")
+    st.write("There are no user accounts. Streamlit Community Cloud provides no persistent "
+             "storage, so anything written by the application is lost when it restarts. "
+             "Instead, the sidebar saves the complete configuration, bed geometry, selectivity "
+             "parameters, regulatory limits and influent table, to a single project file. "
+             "That file can be reloaded later, version controlled, attached to a report, or "
+             "sent to a colleague who will get identical results.")
+
+    st.divider()
+    st.caption("Aadit P. Krishna  ·  Central Academy of Technology and Arts, Monroe, "
+               "North Carolina")
+
 elif page == "Alkalinity converter":
     st.title("Alkalinity to bicarbonate")
     st.write("The model takes bicarbonate in meq/L. Convert from an alkalinity and pH pair here. "
@@ -632,5 +748,5 @@ else:
             Sh=(2+0.644*Re**0.5*Sc**(1/3))*(1+1.5*(1-st.session_state.EBED))
             out.append(Sh*D/dP)
         tbl["kL cm/s"]=out
-        st.caption(f"Water at {T_c:.0f} deg C — viscosity {mu:.5f} P, density {rho:.4f} g/cm3")
+        st.caption(f"Water at {T_c:.0f} deg C, viscosity {mu:.5f} P, density {rho:.4f} g/cm3")
         st.dataframe(tbl,use_container_width=True,hide_index=True)
