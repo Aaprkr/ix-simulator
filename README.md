@@ -14,13 +14,13 @@ using EPA's transport equations, not a single-species curve fit.
 Given the PFAS species you actually measured, their concentrations, and your column geometry,
 it predicts:
 
-- **Breakthrough time** - the day effluent first crosses a regulatory limit or chosen threshold,
+- **Breakthrough time** — the day effluent first crosses a regulatory limit or chosen threshold,
   per species
-- **Limiting species** - which compound actually governs changeout, which is often not the one
+- **Limiting species** — which compound actually governs changeout, which is often not the one
   with the strictest regulatory limit
-- **Bed volumes** - the standard unit for comparing IX systems independent of scale
-- **Cost** - resin charge, changeouts per year, cost per 1,000 gallons treated
-- **Required bed depth** - solved backwards from a target service life
+- **Bed volumes** — the standard unit for comparing IX systems independent of scale
+- **Cost** — resin charge, changeouts per year, cost per 1,000 gallons treated
+- **Required bed depth** — solved backwards from a target service life
 
 ## Pages
 
@@ -39,15 +39,15 @@ it predicts:
 
 Every selectivity coefficient (KxA) in the app is labeled by where it came from:
 
-- **EPA measured** - five PFCAs (PFBA, PFPeA, PFHxA, PFHpA, PFOA), taken directly from EPA's
+- **EPA measured** — five PFCAs (PFBA, PFPeA, PFHxA, PFHpA, PFOA), taken directly from EPA's
   published example workbook, `Shiny-IEX/Examples/example_input_medium.xlsx`, in the
   [USEPA/Water_Treatment_Models](https://github.com/USEPA/Water_Treatment_Models) repository.
   Molecular weights from `PSDM/PFAS_properties.xlsx` in the same repo.
-- **Derived** - three PFSAs (PFBS, PFHxS, PFOS), set at 100x the same-chain-length PFCA value,
+- **Derived** — three PFSAs (PFBS, PFHxS, PFOS), set at 100x the same-chain-length PFCA value,
   following Liu et al., *Strong Base Anion Exchange Selectivity of Nine Perfluoroalkyl Chemicals
   Relevant to Drinking Water*, ACS ES&T Water (2023), which reports sulfonate selectivity
   roughly two orders of magnitude above carboxylates at equal chain length.
-- **Extrapolated** - PFNA, from a log-linear regression fitted to EPA's own PFCA series
+- **Extrapolated** — PFNA, from a log-linear regression fitted to EPA's own PFCA series
   (R² = 0.963, 0.403 log₁₀ units per CF₂).
 
 This parameter set reproduces the published PFAS breakthrough order from NEWMOA's ion exchange
@@ -76,7 +76,7 @@ used and flagged in the app; confirm with the vendor before relying on it.
 
 The physics is unmodified EPA code: [`ixpy.hsdmix`](https://github.com/USEPA/Water_Treatment_Models/tree/master/IonExchangeModel),
 solving the multi-component HSDM transport equations via orthogonal collocation. This app builds
-the input workbook in memory and calls that engine directly - no reimplementation of the
+the input workbook in memory and calls that engine directly — no reimplementation of the
 underlying chemistry.
 
 ## Running locally
@@ -104,7 +104,7 @@ requirements.txt
 ## Limitations
 
 This is a screening tool, not a substitute for pilot testing. Derived and extrapolated
-selectivity values carry real uncertainty - the ordering they produce is validated against
+selectivity values carry real uncertainty — the ordering they produce is validated against
 published data, but absolute bed-volume predictions for the derived sulfonates have not been
 checked against column data. Cost estimates cover resin media only and exclude vessels,
 installation, labor, and spent-resin disposal.
